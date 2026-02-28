@@ -68,9 +68,10 @@ async function detectRegion(ip) {
   return { city: 'Unknown', region: '', country: '', cityCN: '未知', emoji: '🌐' };
 }
 
-function generateNodeName(geo, existingNodes, isHomeNetwork = false) {
+function generateNodeName(geo, existingNodes, hasSocks5 = false) {
   const city = geo.cityCN;
-  const prefix = isHomeNetwork ? '🏠' : geo.emoji;
+  // 命名规则：普通=小国旗；家宽落地=小国旗+小房子
+  const prefix = hasSocks5 ? `${geo.emoji}🏠` : geo.emoji;
   const usedNames = new Set(existingNodes.map(n => {
     const match = n.name.match(/-(.{4})$/);
     return match ? match[1] : '';
@@ -647,9 +648,17 @@ async function deploySsNode(sshInfo, db) {
   const ssMethod = sshInfo.ss_method || 'aes-256-gcm';
 
   const geo = await detectRegion(sshInfo.host);
+  let displayGeo = geo;
+  const hasSocks5 = !!sshInfo.socks5_host;
+  if (hasSocks5) {
+    const socks5Geo = await detectRegion(sshInfo.socks5_host);
+    if (socks5Geo.city && socks5Geo.city !== 'Unknown' && socks5Geo.cityCN !== '未知') {
+      displayGeo = socks5Geo;
+    }
+  }
   const existingNodes = db.getAllNodes();
-  const name = generateNodeName(geo, existingNodes, false);
-  const region = `${geo.emoji} ${geo.cityCN}`;
+  const name = generateNodeName(displayGeo, existingNodes, hasSocks5);
+  const region = `${displayGeo.emoji} ${displayGeo.cityCN}`;
 
   const nodeData = {
     name, host: sshInfo.host, port, uuid: '00000000-0000-0000-0000-000000000000',
