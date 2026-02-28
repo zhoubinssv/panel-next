@@ -82,22 +82,13 @@ function generateNodeName(geo, existingNodes, isHomeNetwork = false) {
   return `${prefix} ${city}-${name}`;
 }
 
-// ========== 生成 xray 多用户配置 ==========
-
-// 生成 xray email 标签（用于流量统计）
+// 统一生成 xray client email（仅用于识别/统计，避免暴露真实信息）
 function makeEmail(userId) {
-  return `user-${userId}@panel`;
+  const safe = String(userId ?? '0').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || '0';
+  return `u-${safe}@p`;
 }
 
-// 构建 clients 数组 JSON（带 email 标签用于流量统计）
-function buildClientsJson(userUuids) {
-  const clients = userUuids.map(u => ({
-    id: u.uuid,
-    level: 0,
-    email: `user-${u.user_id}@panel`
-  }));
-  return JSON.stringify(clients);
-}
+// ========== 生成 xray 多用户配置 ==========
 
 // 生成完整 xray 配置（多用户 + stats + API + Reality）
 function buildXrayConfig(port, clients, outbounds, realityOpts) {
@@ -617,7 +608,7 @@ function buildDualXrayConfig(vlessPort, ssPort, vlessClients, ssClients, ssMetho
         settings: { address: '127.0.0.1' }
       }
     ],
-    outbounds: outbounds,
+    outbounds,
     routing: {
       rules: [
         { type: 'field', inboundTag: ['api-in'], outboundTag: 'api' },
