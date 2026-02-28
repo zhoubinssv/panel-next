@@ -137,19 +137,29 @@ router.post('/nodes/:id/delete', (req, res) => {
   res.redirect('/admin#nodes');
 });
 
-router.post('/nodes/:id/update-host', (req, res) => {
-  const { host } = req.body;
+function updateNodeBasicInfo(req, res) {
+  const { host, name } = req.body;
   const id = parseIntId(req.params.id);
   if (!id) return res.status(400).json({ error: '参数错误' });
-  if (!host || !isValidHost(host)) return res.status(400).json({ error: 'host 格式非法' });
+
+  const trimmedHost = String(host || '').trim();
+  const trimmedName = String(name || '').trim();
+  if (!trimmedHost || !isValidHost(trimmedHost)) return res.status(400).json({ error: 'host 格式非法' });
+  if (!trimmedName) return res.status(400).json({ error: '节点名称不能为空' });
+
   const node = db.getNodeById(id);
-  if (node && host?.trim()) {
+  if (node) {
     const oldHost = node.host;
-    db.updateNode(node.id, { host: host.trim(), ssh_host: host.trim() });
-    db.addAuditLog(req.user.id, 'node_update_ip', `${node.name} IP变更: ${oldHost} → ${host.trim()}`, req.clientIp || req.ip);
+    const oldName = node.name;
+    db.updateNode(node.id, { name: trimmedName, host: trimmedHost, ssh_host: trimmedHost });
+    db.addAuditLog(req.user.id, 'node_update_basic', `节点更新: ${oldName}(${oldHost}) → ${trimmedName}(${trimmedHost})`, req.clientIp || req.ip);
   }
   res.redirect('/admin#nodes');
-});
+}
+
+router.post('/nodes/:id/update-basic', updateNodeBasicInfo);
+// 兼容旧入口
+router.post('/nodes/:id/update-host', updateNodeBasicInfo);
 
 router.post('/nodes/:id/update-level', async (req, res) => {
   const id = parseIntId(req.params.id);

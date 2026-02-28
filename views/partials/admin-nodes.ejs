@@ -63,17 +63,8 @@
         </div>
         <div><span class="text-gray-500">最后检测</span><span class="block text-gray-500 mt-0.5"><%= n.last_check || '-' %></span></div>
       </div>
-      <!-- 地址编辑表单 -->
-      <form method="POST" action="/admin/api/nodes/<%= n.id %>/update-host" class="hidden" id="host-form-m-<%= n.id %>">
-        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
-        <div class="flex gap-1">
-          <input type="text" name="host" value="<%= n.host %>" class="flex-1 bg-black/30 text-white px-2 py-1 rounded-lg border border-white/10 text-xs">
-          <button class="text-emerald-400 text-xs">✓</button>
-          <button type="button" onclick="toggleEdit(<%= n.id %>)" class="text-gray-500 text-xs">✕</button>
-        </div>
-      </form>
       <div class="flex gap-2 pt-1 border-t border-white/5">
-        <button onclick="toggleEdit(<%= n.id %>)" class="text-rose-400 hover:text-rose-300 text-xs">编辑</button>
+        <button onclick='openNodeEditModal(<%= n.id %>, <%- JSON.stringify(n.name) %>, <%- JSON.stringify(n.host) %>)' class="text-rose-400 hover:text-rose-300 text-xs">编辑</button>
         <button onclick="restartXray(<%= n.id %>, this)" class="text-amber-400 hover:text-amber-300 text-xs">重启</button>
         <form method="POST" action="/admin/api/nodes/<%= n.id %>/delete" class="inline">
           <input type="hidden" name="_csrf" value="<%= csrfToken %>">
@@ -100,14 +91,6 @@
             <td class="py-3 px-4 font-medium text-white text-xs"><%= n.name %></td>
             <td class="py-3 px-4">
               <code class="text-xs text-gray-400 break-all" id="host-display-<%= n.id %>"><%= n.host %></code>
-              <form method="POST" action="/admin/api/nodes/<%= n.id %>/update-host" class="hidden mt-1" id="host-form-<%= n.id %>">
-                <input type="hidden" name="_csrf" value="<%= csrfToken %>">
-                <div class="flex gap-1">
-                  <input type="text" name="host" value="<%= n.host %>" class="bg-black/30 text-white px-2 py-1 rounded-lg border border-white/10 text-xs w-32">
-                  <button class="text-emerald-400 text-xs">✓</button>
-                  <button type="button" onclick="toggleEdit(<%= n.id %>)" class="text-gray-500 text-xs">✕</button>
-                </div>
-              </form>
             </td>
             <td class="py-3 px-4 text-xs"><%= n.port %></td>
             <td class="py-3 px-4">
@@ -153,7 +136,7 @@
             </td>
             <td class="py-3 px-4 text-xs text-gray-500 hidden md:table-cell"><%= n.last_check || '-' %></td>
             <td class="py-3 px-4 space-x-2">
-              <button onclick="toggleEdit(<%= n.id %>)" class="text-rose-400 hover:text-rose-300 text-xs">编辑</button>
+              <button onclick='openNodeEditModal(<%= n.id %>, <%- JSON.stringify(n.name) %>, <%- JSON.stringify(n.host) %>)' class="text-rose-400 hover:text-rose-300 text-xs">编辑</button>
               <button onclick="restartXray(<%= n.id %>, this)" class="text-amber-400 hover:text-amber-300 text-xs">重启</button>
               <form method="POST" action="/admin/api/nodes/<%= n.id %>/delete" class="inline">
                 <input type="hidden" name="_csrf" value="<%= csrfToken %>">
@@ -224,11 +207,61 @@
     </form>
   </details>
 
+  <!-- 节点编辑弹窗 -->
+  <div id="node-edit-modal" class="fixed inset-0 z-50 hidden">
+    <div class="absolute inset-0 bg-black/60" onclick="closeNodeEditModal()"></div>
+    <div class="absolute inset-0 flex items-center justify-center p-4">
+      <form id="node-edit-form" method="POST" class="w-full max-w-md glass rounded-2xl p-4 space-y-3 border border-white/10" onsubmit="return submitNodeEdit(this)">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <h3 class="text-white text-sm font-medium">编辑节点</h3>
+        <input type="hidden" name="id" id="node-edit-id">
+        <div>
+          <label class="text-xs text-gray-400">节点名称</label>
+          <input type="text" name="name" id="node-edit-name" required class="mt-1 w-full bg-black/30 text-white px-3 py-2 rounded-xl border border-white/10 text-sm">
+        </div>
+        <div>
+          <label class="text-xs text-gray-400">节点 IP</label>
+          <input type="text" name="host" id="node-edit-host" required class="mt-1 w-full bg-black/30 text-white px-3 py-2 rounded-xl border border-white/10 text-sm">
+        </div>
+        <div class="flex justify-end gap-2 pt-1">
+          <button type="button" onclick="closeNodeEditModal()" class="px-3 py-1.5 rounded-lg text-xs text-gray-300 hover:text-white">取消</button>
+          <button id="node-edit-submit" class="px-3 py-1.5 rounded-lg text-xs bg-rose-600 hover:bg-rose-500 text-white">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
 </div>
 
 <script nonce="<%= nonce %>">
 // CSRF token
 const _csrf = '<%= csrfToken %>';
+
+function openNodeEditModal(id, name, host) {
+  const modal = document.getElementById('node-edit-modal');
+  const form = document.getElementById('node-edit-form');
+  document.getElementById('node-edit-id').value = id;
+  document.getElementById('node-edit-name').value = name || '';
+  document.getElementById('node-edit-host').value = host || '';
+  form.action = '/admin/api/nodes/' + id + '/update-basic';
+  modal.classList.remove('hidden');
+}
+
+function closeNodeEditModal() {
+  document.getElementById('node-edit-modal').classList.add('hidden');
+}
+
+function submitNodeEdit(form) {
+  const name = (form.name.value || '').trim();
+  const host = (form.host.value || '').trim();
+  if (!name) { toast('节点名称不能为空', 2200, 'error'); return false; }
+  if (!host) { toast('节点 IP 不能为空', 2200, 'error'); return false; }
+  form.name.value = name;
+  form.host.value = host;
+  const btn = document.getElementById('node-edit-submit');
+  btn.textContent = '保存中...';
+  btn.disabled = true;
+  return true;
+}
 
 // 滑块开关切换
 function toggleDeploy(type) {

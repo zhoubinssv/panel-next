@@ -62,8 +62,10 @@ function switchTab(name) {
 })();
 
 function toggleEdit(id) {
-  document.getElementById('host-display-' + id).classList.toggle('hidden');
-  document.getElementById('host-form-' + id).classList.toggle('hidden');
+  // 兼容旧按钮：统一改为弹窗编辑
+  if (typeof openNodeEditModal === 'function') {
+    openNodeEditModal(id);
+  }
 }
 
 function updateNodeLevel(id, level) {
