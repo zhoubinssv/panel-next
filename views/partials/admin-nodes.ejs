@@ -64,7 +64,7 @@
         <div><span class="text-gray-500">最后检测</span><span class="block text-gray-500 mt-0.5"><%= n.last_check || '-' %></span></div>
       </div>
       <div class="flex gap-2 pt-1 border-t border-white/5">
-        <button onclick='openNodeEditModal(<%= n.id %>, <%- JSON.stringify(n.name) %>, <%- JSON.stringify(n.host) %>)' class="text-rose-400 hover:text-rose-300 text-xs">编辑</button>
+        <button onclick="openNodeEditModalFromBtn(this)" data-id="<%= n.id %>" data-name="<%= n.name %>" data-host="<%= n.host %>" class="text-rose-400 hover:text-rose-300 text-xs">编辑</button>
         <button onclick="restartXray(<%= n.id %>, this)" class="text-amber-400 hover:text-amber-300 text-xs">重启</button>
         <form method="POST" action="/admin/api/nodes/<%= n.id %>/delete" class="inline">
           <input type="hidden" name="_csrf" value="<%= csrfToken %>">
@@ -136,7 +136,7 @@
             </td>
             <td class="py-3 px-4 text-xs text-gray-500 hidden md:table-cell"><%= n.last_check || '-' %></td>
             <td class="py-3 px-4 space-x-2">
-              <button onclick='openNodeEditModal(<%= n.id %>, <%- JSON.stringify(n.name) %>, <%- JSON.stringify(n.host) %>)' class="text-rose-400 hover:text-rose-300 text-xs">编辑</button>
+              <button onclick="openNodeEditModalFromBtn(this)" data-id="<%= n.id %>" data-name="<%= n.name %>" data-host="<%= n.host %>" class="text-rose-400 hover:text-rose-300 text-xs">编辑</button>
               <button onclick="restartXray(<%= n.id %>, this)" class="text-amber-400 hover:text-amber-300 text-xs">重启</button>
               <form method="POST" action="/admin/api/nodes/<%= n.id %>/delete" class="inline">
                 <input type="hidden" name="_csrf" value="<%= csrfToken %>">
@@ -244,6 +244,14 @@ function openNodeEditModal(id, name, host) {
   document.getElementById('node-edit-host').value = host || '';
   form.action = '/admin/api/nodes/' + id + '/update-basic';
   modal.classList.remove('hidden');
+}
+
+function openNodeEditModalFromBtn(btn) {
+  const id = btn?.dataset?.id;
+  const name = btn?.dataset?.name || '';
+  const host = btn?.dataset?.host || '';
+  if (!id) return;
+  openNodeEditModal(id, name, host);
 }
 
 function closeNodeEditModal() {
