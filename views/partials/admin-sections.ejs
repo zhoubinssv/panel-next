@@ -46,6 +46,7 @@
   <script nonce="<%= nonce %>">
   (function(){
     const csrfToken = '<%= csrfToken %>';
+    window._csrf = csrfToken;
     let _searchTimer = null;
     let _userSortBy = 'total_traffic';
     let _userSortDir = 'DESC';
@@ -323,15 +324,16 @@
       <h3 class="text-white text-sm font-medium">📈 订阅访问统计</h3>
       <div class="flex items-center gap-2 flex-wrap">
         <select id="substats-hours" class="bg-black/30 text-gray-300 text-xs px-2 py-1 rounded-lg border border-white/10">
-          <option value="1">1小时</option><option value="24" selected>24小时</option><option value="168">7天</option>
+          <option value="1">1小时</option><option value="24" selected>24小时</option><option value="72">3天</option><option value="168">7天</option>
         </select>
         <select id="substats-sort" class="bg-black/30 text-gray-300 text-xs px-2 py-1 rounded-lg border border-white/10">
-          <option value="count">拉取次数</option><option value="ip">IP数量</option><option value="last">最近拉取</option>
+          <option value="request">总请求</option><option value="success">成功数</option><option value="deny">拒绝数</option><option value="ok_rate">成功率</option><option value="ip">IP数量</option><option value="ua">UA数量</option><option value="last">最近拉取</option>
         </select>
-        <label class="flex items-center gap-1 text-gray-400 text-xs"><input type="checkbox" id="substats-high" class="accent-rose-500"> 仅高风险</label>
+        <label class="flex items-center gap-1 text-gray-400 text-xs"><input type="checkbox" id="substats-high" class="accent-rose-500"> 仅高风险用户</label>
         <button onclick="loadSubStats(1)" class="bg-rose-600 hover:bg-rose-500 text-white text-xs px-3 py-1.5 rounded-lg transition">查询</button>
       </div>
     </div>
+    <div id="substats-overview" class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3"></div>
     <div id="substats-result">
       <p class="text-gray-600 text-sm text-center py-4">点击「查询」查看统计</p>
     </div>

@@ -24,9 +24,25 @@ function recordTraffic(userId, nodeId, uplink, downlink) {
       total_down = total_down + excluded.total_down,
       updated_at = datetime('now')
   `).run(userId, uplink, downlink);
+  try {
+    _getDb().prepare(`
+      INSERT INTO traffic_site_total (id, total_up, total_down, updated_at)
+      VALUES (1, ?, ?, datetime('now'))
+      ON CONFLICT(id) DO UPDATE SET
+        total_up = total_up + excluded.total_up,
+        total_down = total_down + excluded.total_down,
+        updated_at = datetime('now')
+    `).run(uplink, downlink);
+  } catch (_) {}
 }
 
 function getUserTraffic(userId) {
+  const total = _getDb().prepare(`
+    SELECT COALESCE(total_up, 0) as total_up, COALESCE(total_down, 0) as total_down
+    FROM traffic_user_total WHERE user_id = ?
+  `).get(userId);
+  if (total) return total;
+  // 兼容：极少数老数据未回填时兜底
   return _getDb().prepare(`
     SELECT COALESCE(SUM(uplink), 0) as total_up, COALESCE(SUM(downlink), 0) as total_down
     FROM traffic_daily WHERE user_id = ?
@@ -66,6 +82,14 @@ function getNodeTraffic(nodeId) {
 }
 
 function getGlobalTraffic() {
+  try {
+    const total = _getDb().prepare(`
+      SELECT COALESCE(total_up, 0) as total_up, COALESCE(total_down, 0) as total_down
+      FROM traffic_site_total WHERE id = 1
+    `).get();
+    if (total) return total;
+  } catch (_) {}
+  // 兼容：历史库不存在 traffic_site_total 时兜底
   return _getDb().prepare(`
     SELECT COALESCE(SUM(uplink), 0) as total_up, COALESCE(SUM(downlink), 0) as total_down
     FROM traffic_daily
@@ -171,9 +195,37 @@ function getUserTrafficDailyAgg(userId, days = 30) {
   `).all(userId, startDate);
 }
 
+function cleanupTrafficHistory(rawRetentionDays = 30, dailyRetentionDays = 120) {
+  const rawDays = Math.max(1, parseInt(rawRetentionDays) || 30);
+  const dailyDays = Math.max(30, parseInt(dailyRetentionDays) || 120);
+  const dailyCutoff = dateKeyDaysAgo(dailyDays - 1, 'Asia/Shanghai');
+
+  const tx = _getDb().transaction(() => {
+    const r1 = _getDb().prepare(`
+      DELETE FROM traffic
+      WHERE recorded_at < datetime('now', 'localtime', ?)
+    `).run(`-${rawDays} days`);
+
+    const r2 = _getDb().prepare(`
+      DELETE FROM traffic_daily
+      WHERE date < ?
+    `).run(dailyCutoff);
+
+    return {
+      rawDeleted: r1.changes || 0,
+      dailyDeleted: r2.changes || 0,
+      rawDays,
+      dailyDays,
+      dailyCutoff,
+    };
+  });
+
+  return tx();
+}
+
 module.exports = {
   init,
   recordTraffic, getUserTraffic, getAllUsersTraffic, getNodeTraffic,
   getGlobalTraffic, getTodayTraffic, getUsersTrafficByRange, getNodesTrafficByRange,
-  getTrafficTrend, getUserTrafficDaily, getUserTrafficDailyAgg
+  getTrafficTrend, getUserTrafficDaily, getUserTrafficDailyAgg, cleanupTrafficHistory
 };

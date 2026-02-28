@@ -45,8 +45,11 @@ function csrfProtection(req, res, next) {
 
   // JSON API：检查 Origin/Referer（浏览器跨站 fetch 会带 Origin）
   if (req.is('json')) {
-    if (!isOriginAllowed(req)) {
-      return res.status(403).json({ error: 'CSRF 校验失败：Origin 不匹配' });
+    if (isOriginAllowed(req)) return next();
+    // 反代/特殊浏览器场景兜底：允许 X-CSRF-Token
+    const token = req.headers['x-csrf-token'];
+    if (!token || token !== req.session.csrfToken) {
+      return res.status(403).json({ error: 'CSRF 校验失败：Origin 不匹配且 Token 无效' });
     }
     return next();
   }

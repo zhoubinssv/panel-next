@@ -9,6 +9,7 @@ const { notify } = require('../services/notify');
 const { getOnlineCache } = require('../services/health');
 const { escapeHtml } = require('../utils/escapeHtml');
 const { getClientIp } = require('../utils/clientIp');
+const { appendSignature, verifySignature, getConfig: getSubSignConfig } = require('../utils/subSignature');
 const { dateKeyInTimeZone, toSqlUtc, formatDateTimeInTimeZone } = require('../utils/time');
 const { createSubGuard } = require('../services/subGuard');
 
@@ -53,6 +54,7 @@ const subGuard = createSubGuard({
   behaviorMaxIps: process.env.SUB_BEHAVIOR_MAX_IPS || '6',
   behaviorMaxUas: process.env.SUB_BEHAVIOR_MAX_UAS || '4',
 });
+const subSignConfig = getSubSignConfig();
 
 function invalidateSubCache(token) {
   if (token) _subCache.delete(token);
@@ -111,6 +113,39 @@ function applySubGuards(token, ua, clientIP) {
       db.addAuditLog(null, 'sub_unknown_ua', `未知客户端 UA: ${String(ua || '').slice(0, 180)} token:${token.slice(0, 8)} ip:${clientIP}`, clientIP);
   }
   return result;
+}
+
+function buildSubUrl(req, token, scope = 'sub') {
+  const path = scope === 'sub6' ? `/sub6/${token}` : `/sub/${token}`;
+  const base = `${req.protocol}://${req.get('host')}${path}`;
+  return appendSignature(base, token, scope);
+}
+
+function readSubSignatureFromQuery(req) {
+  const raw = req.query?.[subSignConfig.paramName];
+  if (Array.isArray(raw)) return String(raw[0] || '');
+  return String(raw || '');
+}
+
+function resolveSubUserIdByToken(token) {
+  const user = db.getUserBySubToken(token);
+  return user?.id || null;
+}
+
+function logSubAccessEventSafe(input = {}) {
+  try {
+    db.logSubAccessEvent({
+      userId: input.userId || null,
+      tokenPrefix: String(input.token || '').slice(0, 8),
+      route: input.route || 'sub',
+      result: input.result || 'allow',
+      reason: input.reason || 'ok',
+      ip: input.ip || '',
+      ua: input.ua || '',
+      clientType: input.clientType || '',
+      httpStatus: input.httpStatus || 200,
+    });
+  } catch (_) {}
 }
 
 // 首页 - 节点列表（每个用户看到自己的 UUID）
@@ -223,8 +258,8 @@ router.get('/', requireAuth, (req, res) => {
     user, userNodes, traffic, globalTraffic, formatBytes,
     trafficLimit: user.traffic_limit || 0,
     nodeAiTags,
-    subUrl: `${req.protocol}://${req.get('host')}/sub/${user.sub_token}`,
-    subUrl6: `${req.protocol}://${req.get('host')}/sub6/${user.sub_token}`,
+    subUrl: buildSubUrl(req, user.sub_token, 'sub'),
+    subUrl6: buildSubUrl(req, user.sub_token, 'sub6'),
     nextUuidResetAt: nextUuidResetAtMs(),
     nextSubResetAt: nextTokenResetAtMs(user),
     announcement: db.getSetting('announcement') || '',
@@ -297,7 +332,7 @@ router.get('/api/peach-status', requireAuth, (req, res) => {
 // 当前登录用户订阅二维码（便于手机扫码）
 router.get('/sub-qr', requireAuth, async (req, res) => {
   try {
-    const subUrl = `${req.protocol}://${req.get('host')}/sub/${req.user.sub_token}`;
+    const subUrl = buildSubUrl(req, req.user.sub_token, 'sub');
     const png = await QRCode.toBuffer(subUrl, {
       width: 300,
       margin: 1,
@@ -317,7 +352,7 @@ router.get('/sub-qr', requireAuth, async (req, res) => {
 // IPv6 订阅二维码
 router.get('/sub6-qr', requireAuth, async (req, res) => {
   try {
-    const subUrl6 = `${req.protocol}://${req.get('host')}/sub6/${req.user.sub_token}`;
+    const subUrl6 = buildSubUrl(req, req.user.sub_token, 'sub6');
     const png = await QRCode.toBuffer(subUrl6, {
       width: 300,
       margin: 1,
@@ -338,20 +373,59 @@ router.get('/sub6-qr', requireAuth, async (req, res) => {
 router.get('/sub/:token', subLimiter, (req, res) => {
   const token = req.params.token;
   const ua = req.headers['user-agent'] || '';
+  const clientIP = getClientIp(req);
+  const forceType = req.query.type;
+  const clientType = forceType || detectClient(ua);
+  const eventBase = { token, route: 'sub', ip: clientIP, ua, clientType };
+  const sig = readSubSignatureFromQuery(req);
+  const sigGuard = verifySignature(token, sig, 'sub');
+  if (!sigGuard.ok) {
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: resolveSubUserIdByToken(token),
+      result: 'deny',
+      reason: sigGuard.reason || 'signature_invalid',
+      httpStatus: sigGuard.status || 403,
+    });
+    return res.status(sigGuard.status).type('text').send(sigGuard.message);
+  }
+  if (sigGuard.shouldLog) {
+    db.addAuditLog(null, 'sub_sig_observe', `签名异常已放行 token:${token.slice(0, 8)} ip:${clientIP}`, clientIP);
+  }
 
   // 拒绝空 UA 请求（防止订阅聚合/转换工具拉取）
   if (!ua.trim()) {
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: resolveSubUserIdByToken(token),
+      result: 'deny',
+      reason: 'empty_ua',
+      httpStatus: 403,
+    });
     return res.status(403).type('text').send('User-Agent is required');
   }
-
-  const forceType = req.query.type;
-  const clientType = forceType || detectClient(ua);
   const cacheKey = `${token}:${clientType}`;
 
   // 记录拉取 IP（始终执行，不受缓存影响）
-  const clientIP = getClientIp(req);
   const guard = applySubGuards(token, ua, clientIP);
-  if (!guard.ok) return res.status(guard.status).type('text').send(guard.message);
+  if (!guard.ok) {
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: resolveSubUserIdByToken(token),
+      result: 'deny',
+      reason: guard.reason || 'guard_blocked',
+      httpStatus: guard.status || 429,
+    });
+    return res.status(guard.status).type('text').send(guard.message);
+  }
+
+  let allowReason = 'ok';
+  if (sigGuard.reason && sigGuard.reason !== 'signature_ok' && sigGuard.reason !== 'signature_off') {
+    allowReason = sigGuard.reason;
+  }
+  if (guard.reason && guard.reason !== 'ok') {
+    allowReason = guard.reason;
+  }
 
   // 检查缓存
   const cached = _subCache.get(cacheKey);
@@ -361,13 +435,37 @@ router.get('/sub/:token', subLimiter, (req, res) => {
     if (user) {
       db.logSubAccess(user.id, clientIP, ua);
     }
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: user?.id || null,
+      result: 'allow',
+      reason: allowReason === 'ok' ? 'ok_cache' : `${allowReason}_cache`,
+      httpStatus: 200,
+    });
     res.set(cached.headers);
     return res.send(cached.body);
   }
 
   const user = db.getUserBySubToken(token);
-  if (!user) return res.status(403).send('无效的订阅链接');
-  if (user.trust_level < 1 && !db.isInWhitelist(user.nodeloc_id)) return res.status(403).send('账号等级不足，请在 NodeLoc 论坛升级到1级后使用');
+  if (!user) {
+    logSubAccessEventSafe({
+      ...eventBase,
+      result: 'deny',
+      reason: 'invalid_token',
+      httpStatus: 403,
+    });
+    return res.status(403).send('无效的订阅链接');
+  }
+  if (user.trust_level < 1 && !db.isInWhitelist(user.nodeloc_id)) {
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: user.id,
+      result: 'deny',
+      reason: 'level_not_allowed',
+      httpStatus: 403,
+    });
+    return res.status(403).send('账号等级不足，请在 NodeLoc 论坛升级到1级后使用');
+  }
 
   db.logSubAccess(user.id, clientIP, ua);
 
@@ -406,6 +504,9 @@ router.get('/sub/:token', subLimiter, (req, res) => {
   // 流量超额则返回空节点列表
   const finalNodes = exceeded ? [] : userNodes;
   const subInfo = `upload=${traffic.total_up}; download=${traffic.total_down}; total=${totalBytes}; expire=0`;
+  const finalAllowReason = allowReason === 'ok'
+    ? (exceeded ? 'ok_exceeded' : 'ok')
+    : `${allowReason}${exceeded ? '_exceeded' : ''}`;
 
   const panelName = encodeURIComponent('小姨子的诱惑');
 
@@ -419,6 +520,13 @@ router.get('/sub/:token', subLimiter, (req, res) => {
     };
     const body = generateClashSubForUser(finalNodes);
     setSubCache(cacheKey, { headers, body, ts: Date.now() });
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: user.id,
+      result: 'allow',
+      reason: finalAllowReason,
+      httpStatus: 200,
+    });
     res.set(headers);
     return res.send(body);
   }
@@ -432,6 +540,13 @@ router.get('/sub/:token', subLimiter, (req, res) => {
     };
     const body = generateSingboxSubForUser(finalNodes);
     setSubCache(cacheKey, { headers, body, ts: Date.now() });
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: user.id,
+      result: 'allow',
+      reason: finalAllowReason,
+      httpStatus: 200,
+    });
     res.set(headers);
     return res.send(body);
   }
@@ -445,6 +560,13 @@ router.get('/sub/:token', subLimiter, (req, res) => {
     };
     const body = generateV2raySubForUser(finalNodes, { upload: traffic.total_up, download: traffic.total_down, total: totalBytes });
     setSubCache(cacheKey, { headers, body, ts: Date.now() });
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: user.id,
+      result: 'allow',
+      reason: finalAllowReason,
+      httpStatus: 200,
+    });
     res.set(headers);
     res.send(body);
   }
@@ -454,30 +576,94 @@ router.get('/sub/:token', subLimiter, (req, res) => {
 router.get('/sub6/:token', subLimiter, (req, res) => {
   const token = req.params.token;
   const ua = req.headers['user-agent'] || '';
+  const clientIP = getClientIp(req);
+  const forceType = req.query.type;
+  const clientType = forceType || detectClient(ua);
+  const eventBase = { token, route: 'sub6', ip: clientIP, ua, clientType };
+  const sig = readSubSignatureFromQuery(req);
+  const sigGuard = verifySignature(token, sig, 'sub6');
+  if (!sigGuard.ok) {
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: resolveSubUserIdByToken(token),
+      result: 'deny',
+      reason: sigGuard.reason || 'signature_invalid',
+      httpStatus: sigGuard.status || 403,
+    });
+    return res.status(sigGuard.status).type('text').send(sigGuard.message);
+  }
+  if (sigGuard.shouldLog) {
+    db.addAuditLog(null, 'sub6_sig_observe', `签名异常已放行 token:${token.slice(0, 8)} ip:${clientIP}`, clientIP);
+  }
 
   // 拒绝空 UA 请求
   if (!ua.trim()) {
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: resolveSubUserIdByToken(token),
+      result: 'deny',
+      reason: 'empty_ua',
+      httpStatus: 403,
+    });
     return res.status(403).type('text').send('User-Agent is required');
   }
 
-  const forceType = req.query.type;
-  const clientType = forceType || detectClient(ua);
   const cacheKey = `v6:${token}:${clientType}`;
-  const clientIP = getClientIp(req);
   const guard = applySubGuards(token, ua, clientIP);
-  if (!guard.ok) return res.status(guard.status).type('text').send(guard.message);
+  if (!guard.ok) {
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: resolveSubUserIdByToken(token),
+      result: 'deny',
+      reason: guard.reason || 'guard_blocked',
+      httpStatus: guard.status || 429,
+    });
+    return res.status(guard.status).type('text').send(guard.message);
+  }
+
+  let allowReason = 'ok';
+  if (sigGuard.reason && sigGuard.reason !== 'signature_ok' && sigGuard.reason !== 'signature_off') {
+    allowReason = sigGuard.reason;
+  }
+  if (guard.reason && guard.reason !== 'ok') {
+    allowReason = guard.reason;
+  }
 
   const cached = _subCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < SUB_CACHE_TTL) {
     const user = db.getUserBySubToken(token);
     if (user) db.logSubAccess(user.id, clientIP, ua);
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: user?.id || null,
+      result: 'allow',
+      reason: allowReason === 'ok' ? 'ok_cache' : `${allowReason}_cache`,
+      httpStatus: 200,
+    });
     res.set(cached.headers);
     return res.send(cached.body);
   }
 
   const user = db.getUserBySubToken(token);
-  if (!user) return res.status(403).send('无效的订阅链接');
-  if (user.trust_level < 1 && !db.isInWhitelist(user.nodeloc_id)) return res.status(403).send('账号等级不足，请在 NodeLoc 论坛升级到1级后使用');
+  if (!user) {
+    logSubAccessEventSafe({
+      ...eventBase,
+      result: 'deny',
+      reason: 'invalid_token',
+      httpStatus: 403,
+    });
+    return res.status(403).send('无效的订阅链接');
+  }
+  if (user.trust_level < 1 && !db.isInWhitelist(user.nodeloc_id)) {
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: user.id,
+      result: 'deny',
+      reason: 'level_not_allowed',
+      httpStatus: 403,
+    });
+    return res.status(403).send('账号等级不足，请在 NodeLoc 论坛升级到1级后使用');
+  }
 
   db.logSubAccess(user.id, clientIP, ua);
 
@@ -504,6 +690,9 @@ router.get('/sub6/:token', subLimiter, (req, res) => {
 
   const finalNodes = exceeded ? [] : nodes;
   const subInfo = `upload=${traffic.total_up}; download=${traffic.total_down}; total=${totalBytes}; expire=0`;
+  const finalAllowReason = allowReason === 'ok'
+    ? (exceeded ? 'ok_exceeded' : 'ok')
+    : `${allowReason}${exceeded ? '_exceeded' : ''}`;
   const panelName = encodeURIComponent('小姨子的诱惑-IPv6');
 
   if (clientType === 'clash') {
@@ -516,6 +705,13 @@ router.get('/sub6/:token', subLimiter, (req, res) => {
     };
     const body = generateClashSsSub(finalNodes);
     setSubCache(cacheKey, { headers, body, ts: Date.now() });
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: user.id,
+      result: 'allow',
+      reason: finalAllowReason,
+      httpStatus: 200,
+    });
     res.set(headers);
     return res.send(body);
   }
@@ -529,6 +725,13 @@ router.get('/sub6/:token', subLimiter, (req, res) => {
     };
     const body = generateSingboxSsSub(finalNodes);
     setSubCache(cacheKey, { headers, body, ts: Date.now() });
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: user.id,
+      result: 'allow',
+      reason: finalAllowReason,
+      httpStatus: 200,
+    });
     res.set(headers);
     return res.send(body);
   }
@@ -542,6 +745,13 @@ router.get('/sub6/:token', subLimiter, (req, res) => {
     };
     const body = generateV2raySsSub(finalNodes, { upload: traffic.total_up, download: traffic.total_down, total: totalBytes });
     setSubCache(cacheKey, { headers, body, ts: Date.now() });
+    logSubAccessEventSafe({
+      ...eventBase,
+      userId: user.id,
+      result: 'allow',
+      reason: finalAllowReason,
+      httpStatus: 200,
+    });
     res.set(headers);
     res.send(body);
   }

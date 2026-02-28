@@ -116,7 +116,11 @@ router.get('/users/:id/detail', (req, res) => {
   const d = db.getDb();
   const today = dateKeyInTimeZone(new Date(), 'Asia/Shanghai');
   const todayTraffic = d.prepare('SELECT COALESCE(SUM(uplink),0) as up, COALESCE(SUM(downlink),0) as down FROM traffic_daily WHERE user_id = ? AND date = ?').get(id, today);
-  const totalTraffic = d.prepare('SELECT COALESCE(SUM(uplink),0) as up, COALESCE(SUM(downlink),0) as down FROM traffic_daily WHERE user_id = ?').get(id);
+  const totalTraffic = d.prepare(`
+    SELECT COALESCE(total_up,0) as up, COALESCE(total_down,0) as down
+    FROM traffic_user_total
+    WHERE user_id = ?
+  `).get(id) || { up: 0, down: 0 };
 
   // 订阅拉取记录（最近24h）
   const subAccessRaw = db.getSubAccessUserDetail(id, 24);

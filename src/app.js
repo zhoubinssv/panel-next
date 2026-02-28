@@ -31,6 +31,8 @@ const { configEvents } = require('./services/configEvents');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const DEFAULT_TRAFFIC_RAW_RETENTION_DAYS = Math.max(1, parseInt(process.env.TRAFFIC_RAW_RETENTION_DAYS || '30', 10) || 30);
+const DEFAULT_TRAFFIC_DAILY_RETENTION_DAYS = Math.max(90, parseInt(process.env.TRAFFIC_DAILY_RETENTION_DAYS || '120', 10) || 120);
 
 // 中间件
 app.set('view engine', 'ejs');
@@ -248,12 +250,32 @@ function cleanAuditLogs() {
     try {
       r2 = d.prepare("DELETE FROM sub_access_log WHERE created_at < datetime('now', '-90 days')").run();
     } catch (_) {}
-    logger.info({ audit_log: r1.changes, sub_access_log: r2.changes }, '审计日志清理完成');
+    let r3 = { changes: 0 };
+    try {
+      r3 = d.prepare("DELETE FROM sub_access_event WHERE created_at < datetime('now', '-90 days')").run();
+    } catch (_) {}
+    logger.info({ audit_log: r1.changes, sub_access_log: r2.changes, sub_access_event: r3.changes }, '审计日志清理完成');
   } catch (err) {
     logger.error({ err }, '审计日志清理失败');
   }
 }
 cron.schedule('30 4 * * *', cleanAuditLogs, { timezone: 'Asia/Shanghai' });
+
+// 每天凌晨 4:40 清理流量历史明细
+// 说明：traffic_site_total / traffic_user_total 为累计值，不受清理影响
+function cleanTrafficHistory() {
+  try {
+    const rawSetting = parseInt(dbModule.getSetting('traffic_raw_retention_days') || '', 10);
+    const dailySetting = parseInt(dbModule.getSetting('traffic_daily_retention_days') || '', 10);
+    const rawDays = Math.max(1, Number.isFinite(rawSetting) ? rawSetting : DEFAULT_TRAFFIC_RAW_RETENTION_DAYS);
+    const dailyDays = Math.max(90, Number.isFinite(dailySetting) ? dailySetting : DEFAULT_TRAFFIC_DAILY_RETENTION_DAYS);
+    const result = dbModule.cleanupTrafficHistory(rawDays, dailyDays);
+    logger.info({ ...result }, '流量历史清理完成');
+  } catch (err) {
+    logger.error({ err }, '流量历史清理失败');
+  }
+}
+cron.schedule('40 4 * * *', cleanTrafficHistory, { timezone: 'Asia/Shanghai' });
 
 // O3: Graceful Shutdown
 function gracefulShutdown(signal) {

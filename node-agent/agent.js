@@ -222,11 +222,33 @@ async function getXrayTraffic() {
     if (!data.stat) return [];
     const records = [];
     for (const stat of data.stat) {
-      const m = stat.name.match(/user>>>user-(\d+)@panel>>>traffic>>>(uplink|downlink)/);
+      let userId = null;
+      let direction = null;
+      let proto = null;
+
+      // 新协议区分格式：
+      // VLESS: u-<id>-v@p
+      // SS:    u-<id>-s@p
+      let m = stat.name.match(/^user>>>u-(\d+)-(v|s)@p>>>traffic>>>(uplink|downlink)$/);
       if (m) {
-        const value = parseInt(stat.value) || 0;
+        userId = parseInt(m[1], 10);
+        proto = m[2] === 's' ? 'ss' : 'vless';
+        direction = m[3];
+      } else {
+        // 兼容历史格式：
+        // 旧: user-<id>@panel
+        // 新(无协议后缀): u-<id>@p
+        m = stat.name.match(/^user>>>(?:user-|u-)(\d+)(?:@panel|@p)>>>traffic>>>(uplink|downlink)$/);
+        if (m) {
+          userId = parseInt(m[1], 10);
+          direction = m[2];
+        }
+      }
+
+      if (userId) {
+        const value = parseInt(stat.value, 10) || 0;
         if (value <= 0) continue;
-        records.push({ userId: parseInt(m[1]), direction: m[2], value });
+        records.push({ userId, direction, value, proto });
       }
     }
     return records;

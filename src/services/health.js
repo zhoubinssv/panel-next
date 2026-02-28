@@ -25,9 +25,83 @@ function checkPort(host, port, timeout = 5000) {
 const _onlineCache = { full: null, summary: null, ts: 0 };
 function getOnlineCache() { return _onlineCache; }
 
+function getNodeHost(node) {
+  return (node?.ssh_host || node?.host || '').trim();
+}
+
+// 同机双协议节点（VLESS/SS）共享同一个 Agent/xray 时，用于状态与在线人数镜像
+function getPeerNodes(node) {
+  const host = getNodeHost(node);
+  if (!host) return [];
+  try {
+    return db.getAllNodes().filter(n =>
+      n.id !== node.id &&
+      getNodeHost(n) === host &&
+      n.protocol !== node.protocol
+    );
+  } catch {
+    return [];
+  }
+}
+
+function updatePeerLastReport(peerNodes, now) {
+  if (!peerNodes || peerNodes.length === 0) return;
+  const stmt = db.getDb().prepare('UPDATE nodes SET agent_last_report = ? WHERE id = ?');
+  for (const peer of peerNodes) {
+    try { stmt.run(now, peer.id); } catch {}
+  }
+}
+
+function mirrorPeerState(peerNodes, status, remark, now) {
+  if (!peerNodes || peerNodes.length === 0) return;
+  for (const peer of peerNodes) {
+    try {
+      db.updateNode(peer.id, {
+        is_active: status,
+        remark,
+        last_check: toSqlUtc(now),
+      });
+      db.getDb().prepare('UPDATE nodes SET agent_last_report = ? WHERE id = ?').run(now, peer.id);
+    } catch {}
+  }
+}
+
+function upsertOnlineNodeCount(cache, nodeId, nodeName, count) {
+  const idx = cache.nodes.findIndex(n => n.nodeId === nodeId);
+  if (idx >= 0) cache.nodes[idx].count = count;
+  else cache.nodes.push({ nodeId, nodeName, count });
+}
+
+function buildProtocolNodeMap(node, peerNodes) {
+  const map = { defaultNodeId: node.id };
+  if (node.protocol === 'vless') map.vlessNodeId = node.id;
+  if (node.protocol === 'ss') map.ssNodeId = node.id;
+  for (const peer of (peerNodes || [])) {
+    if (peer.protocol === 'vless' && !map.vlessNodeId) map.vlessNodeId = peer.id;
+    if (peer.protocol === 'ss' && !map.ssNodeId) map.ssNodeId = peer.id;
+  }
+  return map;
+}
+
+function resolveTargetNodeId(record, protocolNodeMap) {
+  const proto = String(record?.proto || '').toLowerCase();
+  if (proto === 'ss') return protocolNodeMap.ssNodeId || protocolNodeMap.defaultNodeId;
+  if (proto === 'vless' || proto === 'v') return protocolNodeMap.vlessNodeId || protocolNodeMap.defaultNodeId;
+  return protocolNodeMap.defaultNodeId;
+}
+
 // 保存流量记录到数据库
-function saveTrafficRecords(nodeId, records) {
+function saveTrafficRecords(nodeId, records, routeCtx = null) {
   if (!records || records.length === 0) return 0;
+  const node = routeCtx?.node || db.getNodeById(nodeId);
+  if (!node) return 0;
+  const peerNodes = routeCtx?.peerNodes || getPeerNodes(node);
+  const protocolNodeMap = buildProtocolNodeMap(node, peerNodes);
+  const hasProtocolSplit = records.some(r => {
+    const p = String(r?.proto || '').toLowerCase();
+    return p === 'ss' || p === 'vless' || p === 'v';
+  });
+
   const userTraffic = {};
 
   // 兼容旧格式 tag → userId 映射缓存
@@ -52,14 +126,24 @@ function saveTrafficRecords(nodeId, records) {
       if (!userId) continue; // 无法反查，跳过
     }
     if (!userId) continue;
-    if (!userTraffic[userId]) userTraffic[userId] = { up: 0, down: 0 };
-    if (r.direction === 'uplink') userTraffic[userId].up += r.value;
-    else userTraffic[userId].down += r.value;
+
+    const targetNodeId = hasProtocolSplit
+      ? resolveTargetNodeId(r, protocolNodeMap)
+      : nodeId;
+
+    const key = `${targetNodeId}:${userId}`;
+    if (!userTraffic[key]) userTraffic[key] = { up: 0, down: 0 };
+    if (r.direction === 'uplink') userTraffic[key].up += r.value;
+    else userTraffic[key].down += r.value;
   }
   let count = 0;
-  for (const [userId, traffic] of Object.entries(userTraffic)) {
+  for (const [key, traffic] of Object.entries(userTraffic)) {
+    const [targetNodeIdRaw, userIdRaw] = key.split(':');
+    const targetNodeId = parseInt(targetNodeIdRaw, 10);
+    const userId = parseInt(userIdRaw, 10);
+    if (!targetNodeId || !userId) continue;
     if (traffic.up > 0 || traffic.down > 0) {
-      db.recordTraffic(parseInt(userId), nodeId, traffic.up, traffic.down);
+      db.recordTraffic(userId, targetNodeId, traffic.up, traffic.down);
       count++;
     }
   }
@@ -94,7 +178,7 @@ function checkTrafficExceed() {
 }
 
 // 更新在线用户缓存（从流量记录推断）
-function updateOnlineCache(nodeId, trafficRecords) {
+function updateOnlineCache(nodeId, trafficRecords, routeCtx = null) {
   if (!trafficRecords || trafficRecords.length === 0) return;
   const now = Date.now();
   // 仅在缓存不存在或过期时重建
@@ -103,10 +187,16 @@ function updateOnlineCache(nodeId, trafficRecords) {
     _onlineCache.ts = now;
   }
   const cache = _onlineCache.full;
-  const node = db.getNodeById(nodeId);
+  const node = routeCtx?.node || db.getNodeById(nodeId);
   if (!node) return;
+  const peerNodes = routeCtx?.peerNodes || getPeerNodes(node);
+  const protocolNodeMap = buildProtocolNodeMap(node, peerNodes);
+  const hasProtocolSplit = trafficRecords.some(r => {
+    const p = String(r?.proto || '').toLowerCase();
+    return p === 'ss' || p === 'vless' || p === 'v';
+  });
 
-  const nodeUserIds = new Set();
+  const nodeUserIdsMap = new Map();
   for (const r of trafficRecords) {
     // 兼容旧格式：可能只有 tag 没有 userId，通过 uuid 反查
     let uid = r.userId;
@@ -116,20 +206,38 @@ function updateOnlineCache(nodeId, trafficRecords) {
         if (row) uid = row.user_id;
       } catch {}
     }
-    if (uid) nodeUserIds.add(uid);
+    if (!uid) continue;
+    const targetNodeId = hasProtocolSplit ? resolveTargetNodeId(r, protocolNodeMap) : nodeId;
+    if (!nodeUserIdsMap.has(targetNodeId)) nodeUserIdsMap.set(targetNodeId, new Set());
+    nodeUserIdsMap.get(targetNodeId).add(uid);
   }
 
-  // 更新节点在线信息
-  const existIdx = cache.nodes.findIndex(n => n.nodeId === nodeId);
-  if (existIdx >= 0) cache.nodes[existIdx].count = nodeUserIds.size;
-  else cache.nodes.push({ nodeId, nodeName: node.name, count: nodeUserIds.size });
+  // 兼容旧格式：若本轮无协议信息，则对双协议伙伴继续镜像在线人数，避免升级窗口期显示为 0
+  if (!hasProtocolSplit && peerNodes.length > 0) {
+    const reporterUsers = nodeUserIdsMap.get(nodeId) || new Set();
+    for (const peer of peerNodes) {
+      nodeUserIdsMap.set(peer.id, new Set(reporterUsers));
+    }
+  }
+
+  // 更新节点在线信息（协议可拆分时按协议节点分别计数）
+  const trackedNodes = [node, ...peerNodes];
+  for (const n of trackedNodes) {
+    const set = nodeUserIdsMap.get(n.id) || new Set();
+    upsertOnlineNodeCount(cache, n.id, n.name, set.size);
+  }
 
   // 合并用户列表（去重）
   const existingIds = new Set(cache.users.map(u => u.id));
-  for (const uid of nodeUserIds) {
-    if (!existingIds.has(uid)) {
-      const u = db.getUserById(uid);
-      if (u) cache.users.push({ id: u.id, username: u.username });
+  for (const uidSet of nodeUserIdsMap.values()) {
+    for (const uid of uidSet) {
+      if (!existingIds.has(uid)) {
+        const u = db.getUserById(uid);
+        if (u) {
+          cache.users.push({ id: u.id, username: u.username });
+          existingIds.add(uid);
+        }
+      }
     }
   }
   cache.total = cache.users.length;
@@ -146,6 +254,10 @@ function updateFromAgentReport(nodeId, reportData) {
   const now = nowUtcIso();
   const node = db.getNodeById(nodeId);
   if (!node) return;
+  const peerNodes = getPeerNodes(node);
+  const routeCtx = { node, peerNodes };
+  // 共用 Agent 的同机节点也刷新上报时间，避免 SS 节点显示长期未上报
+  updatePeerLastReport(peerNodes, now);
 
   // 判定节点状态
   let status, remark;
@@ -226,8 +338,8 @@ function updateFromAgentReport(nodeId, reportData) {
       try { db.getDb().prepare('UPDATE nodes SET agent_last_report = ? WHERE id = ?').run(now, nodeId); } catch {}
       // 保存流量 & 检测超标
       if (trafficRecords && trafficRecords.length > 0) {
-        saveTrafficRecords(nodeId, trafficRecords);
-        updateOnlineCache(nodeId, trafficRecords);
+        saveTrafficRecords(nodeId, trafficRecords, routeCtx);
+        updateOnlineCache(nodeId, trafficRecords, routeCtx);
       }
       checkTrafficExceed();
       return; // 提前返回，不更新节点为离线
@@ -250,6 +362,8 @@ function updateFromAgentReport(nodeId, reportData) {
     remark,
     last_check: toSqlUtc(now),
   });
+  // 同机双协议节点镜像状态（用于 IPv6 SS 节点展示）
+  mirrorPeerState(peerNodes, status, remark, now);
 
   // 保存 agent 上报时间
   try {
@@ -273,9 +387,9 @@ function updateFromAgentReport(nodeId, reportData) {
 
   // 保存流量记录
   if (trafficRecords && trafficRecords.length > 0) {
-    saveTrafficRecords(nodeId, trafficRecords);
+    saveTrafficRecords(nodeId, trafficRecords, routeCtx);
     // 更新在线用户缓存
-    updateOnlineCache(nodeId, trafficRecords);
+    updateOnlineCache(nodeId, trafficRecords, routeCtx);
   }
 
   // 流量超标检测

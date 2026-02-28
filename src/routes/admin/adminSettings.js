@@ -1,6 +1,7 @@
 const express = require('express');
 const db = require('../../services/database');
 const { notify } = require('../../services/notify');
+const { syncAllNodesConfig } = require('../../services/deploy');
 const { escapeHtml } = require('../../utils/escapeHtml');
 const { dateKeyInTimeZone, formatDateTimeInTimeZone, parseDateInput } = require('../../utils/time');
 const { parseIntId } = require('../../utils/validators');
@@ -85,34 +86,143 @@ router.get('/sub-access/:userId', (req, res) => {
 router.get('/sub-stats', (req, res) => {
   const hours = parseInt(req.query.hours) || 24;
   const page = parseInt(req.query.page) || 1;
-  const sort = req.query.sort || 'count';
+  const sortRaw = String(req.query.sort || 'request');
   const onlyHigh = req.query.high === '1';
   const limit = 20;
   const offset = (page - 1) * limit;
-  const data = db.getSubAccessStats(hours, limit, offset, onlyHigh, sort);
-  if (Array.isArray(data.data)) {
+  const sortMap = {
+    count: 'request',
+    request: 'request',
+    success: 'success',
+    deny: 'deny',
+    ip: 'ip',
+    ua: 'ua',
+    last: 'last',
+    ok_rate: 'ok_rate',
+  };
+  const sort = sortMap[sortRaw] || 'request';
+
+  const data = db.getSubAccessStatsV2(hours, limit, offset, onlyHigh, sort);
+  const hasV2Data = (data.total || 0) > 0;
+  if (hasV2Data && Array.isArray(data.data)) {
     data.data = data.data.map((r) => ({
       ...r,
       last_access_display: formatDateTimeInTimeZone(r.last_access, 'Asia/Shanghai'),
+      source: 'event',
     }));
   }
-  const pages = Math.max(1, Math.ceil((data.total || 0) / limit));
-  res.json({ ...data, page, limit, pages });
+
+  if (hasV2Data) {
+    const pages = Math.max(1, Math.ceil((data.total || 0) / limit));
+    return res.json({ ...data, page, limit, pages, source: 'event' });
+  }
+
+  // 兼容旧数据：若新事件表暂无数据，回退到 sub_access_log 统计
+  const legacySort = sortRaw === 'ip' ? 'ip' : (sortRaw === 'last' ? 'last' : 'count');
+  const legacy = db.getSubAccessStats(hours, limit, offset, onlyHigh, legacySort);
+  if (Array.isArray(legacy.data)) {
+    legacy.data = legacy.data.map((r) => ({
+      ...r,
+      request_count: r.pull_count || 0,
+      ok_count: r.pull_count || 0,
+      deny_count: 0,
+      ok_rate: r.pull_count > 0 ? 100 : 0,
+      deny_rate: 0,
+      deny_ratio: 0,
+      ua_count: 0,
+      top_deny_reason: '',
+      source: 'legacy',
+      last_access_display: formatDateTimeInTimeZone(r.last_access, 'Asia/Shanghai'),
+    }));
+  }
+  const pages = Math.max(1, Math.ceil((legacy.total || 0) / limit));
+  const legacyTotalRequests = (legacy.data || []).reduce((s, x) => s + Number(x.request_count || 0), 0);
+  return res.json({
+    ...legacy,
+    page,
+    limit,
+    pages,
+    source: 'legacy',
+    overview: {
+      total_requests: legacyTotalRequests,
+      allow_requests: legacyTotalRequests,
+      deny_requests: 0,
+      allow_rate: legacyTotalRequests > 0 ? 100 : 0,
+      deny_rate: 0,
+      user_count: Number(legacy.total || 0),
+      denied_user_count: 0,
+      deny_reasons: [],
+    },
+  });
 });
 
 router.get('/sub-stats/:userId/detail', (req, res) => {
   const userId = parseIntId(req.params.userId);
   if (!userId) return res.status(400).json({ error: '参数错误' });
   const hours = parseInt(req.query.hours) || 24;
-  const detail = db.getSubAccessUserDetail(userId, hours);
-  res.json({
-    ...detail,
-    ips: (detail.ips || []).map((r) => ({
+  const detail = db.getSubAccessUserDetailV2(userId, hours);
+  const hasV2Data = Number(detail?.summary?.request_count || 0) > 0;
+  if (hasV2Data) {
+    return res.json({
+      ...detail,
+      source: 'event',
+      summary: {
+        ...detail.summary,
+        last_access_display: formatDateTimeInTimeZone(detail.summary?.last_access, 'Asia/Shanghai'),
+      },
+      ips: (detail.ips || []).map((r) => ({
+        ...r,
+        last_access_display: formatDateTimeInTimeZone(r.last_access, 'Asia/Shanghai'),
+      })),
+      reasons: (detail.reasons || []).map((r) => ({
+        ...r,
+        last_access_display: formatDateTimeInTimeZone(r.last_access, 'Asia/Shanghai'),
+      })),
+      timeline: (detail.timeline || []).map((r) => ({
+        ...r,
+        time_display: formatDateTimeInTimeZone(r.time, 'Asia/Shanghai'),
+      })),
+    });
+  }
+
+  // 兼容旧数据
+  const legacy = db.getSubAccessUserDetail(userId, hours);
+  const legacyReqCount = (legacy.ips || []).reduce((sum, r) => sum + Number(r.count || 0), 0);
+  const legacyLastAccess = legacy.timeline?.[0]?.time || legacy.ips?.[0]?.last_access || null;
+  return res.json({
+    source: 'legacy',
+    summary: {
+      request_count: legacyReqCount,
+      ok_count: legacyReqCount,
+      deny_count: 0,
+      ok_rate: legacyReqCount > 0 ? 100 : 0,
+      deny_rate: 0,
+      ip_count: (legacy.ips || []).length,
+      ua_count: (legacy.uas || []).length,
+      risk_level: 'low',
+      last_access: legacyLastAccess,
+      last_access_display: formatDateTimeInTimeZone(legacyLastAccess, 'Asia/Shanghai'),
+    },
+    ips: (legacy.ips || []).map((r) => ({
       ...r,
+      ok_count: r.count || 0,
+      deny_count: 0,
       last_access_display: formatDateTimeInTimeZone(r.last_access, 'Asia/Shanghai'),
     })),
-    timeline: (detail.timeline || []).map((r) => ({
+    uas: (legacy.uas || []).map((r) => ({
       ...r,
+      ok_count: r.count || 0,
+      deny_count: 0,
+    })),
+    reasons: [],
+    routes: [],
+    timeline: (legacy.timeline || []).map((r) => ({
+      ...r,
+      route: String(r.ua || '').toLowerCase().includes('clash') ? 'sub' : 'sub',
+      result: 'allow',
+      reason: 'legacy_ok',
+      http_status: 200,
+      client_type: '',
       time_display: formatDateTimeInTimeZone(r.time, 'Asia/Shanghai'),
     })),
   });

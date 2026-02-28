@@ -184,12 +184,36 @@ function initTables() {
       updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+
+    -- 全站累计流量汇总表（永久累计，不依赖 traffic_daily 保留周期）
+    CREATE TABLE IF NOT EXISTS traffic_site_total (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      total_up INTEGER DEFAULT 0,
+      total_down INTEGER DEFAULT 0,
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
     -- 订阅拉取 IP 记录
     CREATE TABLE IF NOT EXISTS sub_access_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
       ip TEXT NOT NULL,
       ua TEXT DEFAULT '',
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    -- 订阅访问事件（成功/拒绝全量事件流，用于风控统计）
+    CREATE TABLE IF NOT EXISTS sub_access_event (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      token_prefix TEXT DEFAULT '',
+      route TEXT DEFAULT 'sub',
+      result TEXT NOT NULL DEFAULT 'allow',
+      reason TEXT DEFAULT 'ok',
+      ip TEXT DEFAULT '',
+      ua TEXT DEFAULT '',
+      client_type TEXT DEFAULT '',
+      http_status INTEGER DEFAULT 200,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
@@ -215,10 +239,15 @@ function initTables() {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_traffic_daily_user_date ON traffic_daily(user_id, date);
     CREATE INDEX IF NOT EXISTS idx_traffic_daily_node ON traffic_daily(node_id);
+    CREATE INDEX IF NOT EXISTS idx_traffic_daily_date ON traffic_daily(date);
     CREATE INDEX IF NOT EXISTS idx_traffic_user_total_traffic ON traffic_user_total(total_up, total_down);
     CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_sub_access_log_user_time ON sub_access_log(user_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_sub_access_log_time_user_ip ON sub_access_log(created_at, user_id, ip);
+    CREATE INDEX IF NOT EXISTS idx_sub_access_event_user_time ON sub_access_event(user_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_sub_access_event_time_result ON sub_access_event(created_at, result);
+    CREATE INDEX IF NOT EXISTS idx_sub_access_event_reason_time ON sub_access_event(reason, created_at);
+    CREATE INDEX IF NOT EXISTS idx_sub_access_event_token_time ON sub_access_event(token_prefix, created_at);
     CREATE INDEX IF NOT EXISTS idx_user_node_uuid_node ON user_node_uuid(node_id);
     CREATE INDEX IF NOT EXISTS idx_user_node_uuid_user ON user_node_uuid(user_id);
     CREATE INDEX IF NOT EXISTS idx_traffic_user_node ON traffic(user_id, node_id);
@@ -236,6 +265,13 @@ function initTables() {
   upsert.run('max_users', '0');
   upsert.run('default_traffic_limit', '0');
   upsert.run('agent_token', uuidv4());
+  upsert.run('traffic_raw_retention_days', '30');
+  upsert.run('traffic_daily_retention_days', '120');
+
+  db.prepare(`
+    INSERT OR IGNORE INTO traffic_site_total (id, total_up, total_down, updated_at)
+    VALUES (1, 0, 0, datetime('now'))
+  `).run();
 
   // 注册白名单表
   db.exec(`
@@ -464,6 +500,28 @@ function initTables() {
     }
     db.exec('DELETE FROM traffic_user_total WHERE user_id NOT IN (SELECT id FROM users)');
   } catch (_) {}
+
+  // 全站累计流量汇总初始化（只在首次为空时按历史汇总回填）
+  try {
+    const siteRow = db.prepare('SELECT total_up, total_down FROM traffic_site_total WHERE id = 1').get();
+    const siteTotal = (siteRow?.total_up || 0) + (siteRow?.total_down || 0);
+    if (siteTotal <= 0) {
+      const sum = db.prepare(`
+        SELECT COALESCE(SUM(uplink), 0) as up, COALESCE(SUM(downlink), 0) as down
+        FROM traffic_daily
+      `).get();
+      if ((sum.up || 0) > 0 || (sum.down || 0) > 0) {
+        db.prepare(`
+          INSERT INTO traffic_site_total (id, total_up, total_down, updated_at)
+          VALUES (1, ?, ?, datetime('now'))
+          ON CONFLICT(id) DO UPDATE SET
+            total_up = excluded.total_up,
+            total_down = excluded.total_down,
+            updated_at = datetime('now')
+        `).run(sum.up || 0, sum.down || 0);
+      }
+    }
+  } catch (_) {}
 }
 
 // 导出所有函数（向后兼容）
@@ -508,6 +566,7 @@ module.exports = {
   getAllUsersTraffic: (...a) => trafficRepo.getAllUsersTraffic(...a),
   getNodeTraffic: (...a) => trafficRepo.getNodeTraffic(...a),
   getGlobalTraffic: (...a) => trafficRepo.getGlobalTraffic(...a),
+  cleanupTrafficHistory: (...a) => trafficRepo.cleanupTrafficHistory(...a),
   getTodayTraffic: (...a) => trafficRepo.getTodayTraffic(...a),
   getUsersTrafficByRange: (...a) => trafficRepo.getUsersTrafficByRange(...a),
   getNodesTrafficByRange: (...a) => trafficRepo.getNodesTrafficByRange(...a),
@@ -535,11 +594,15 @@ module.exports = {
   updateAwsAccount: (...a) => awsRepo.updateAwsAccount(...a),
   deleteAwsAccount: (...a) => awsRepo.deleteAwsAccount(...a),
   // 订阅访问
-  logSubAccess: (...a) => subAccessRepo.logSubAccess(...a),
-  getSubAccessIPs: (...a) => subAccessRepo.getSubAccessIPs(...a),
-  getSubAbuseUsers: (...a) => subAccessRepo.getSubAbuseUsers(...a),
-  getSubAccessStats: (...a) => subAccessRepo.getSubAccessStats(...a),
-  getSubAccessUserDetail: (...a) => subAccessRepo.getSubAccessUserDetail(...a),
+  logSubAccess: (...a) => { getDb(); return subAccessRepo.logSubAccess(...a); },
+  logSubAccessEvent: (...a) => { getDb(); return subAccessRepo.logSubAccessEvent(...a); },
+  getSubAccessIPs: (...a) => { getDb(); return subAccessRepo.getSubAccessIPs(...a); },
+  getSubAbuseUsers: (...a) => { getDb(); return subAccessRepo.getSubAbuseUsers(...a); },
+  getSubAccessStats: (...a) => { getDb(); return subAccessRepo.getSubAccessStats(...a); },
+  getSubEventOverview: (...a) => { getDb(); return subAccessRepo.getSubEventOverview(...a); },
+  getSubAccessStatsV2: (...a) => { getDb(); return subAccessRepo.getSubAccessStatsV2(...a); },
+  getSubAccessUserDetail: (...a) => { getDb(); return subAccessRepo.getSubAccessUserDetail(...a); },
+  getSubAccessUserDetailV2: (...a) => { getDb(); return subAccessRepo.getSubAccessUserDetailV2(...a); },
   // 运维
   addDiagnosis: (...a) => opsRepo.addDiagnosis(...a),
   updateDiagnosis: (...a) => opsRepo.updateDiagnosis(...a),

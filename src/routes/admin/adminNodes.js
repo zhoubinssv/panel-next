@@ -57,7 +57,7 @@ router.post('/nodes/deploy-dual', (req, res) => {
 });
 
 router.post('/nodes/deploy-ss', (req, res) => {
-  const { host, ssh_port, ssh_user, ssh_password, ss_method } = req.body;
+  const { host, ssh_port, ssh_user, ssh_password, ss_method, socks5_host, socks5_port, socks5_user, socks5_pass } = req.body;
   if (!host || !ssh_password) return res.redirect('/admin#nodes');
 
   const existing = db.getAllNodes().find(n => n.ssh_host === host.trim() || n.host === host.trim());
@@ -71,6 +71,8 @@ router.post('/nodes/deploy-ss', (req, res) => {
   deployService.deploySsNode({
     host, ssh_port: parseInt(ssh_port) || 22, ssh_user: ssh_user || 'root', ssh_password,
     ss_method: ss_method || 'aes-256-gcm',
+    socks5_host: socks5_host || null, socks5_port: parseInt(socks5_port) || 1080,
+    socks5_user: socks5_user || null, socks5_pass: socks5_pass || null,
     triggered_by: req.user.id
   }, db).catch(err => console.error('[SS部署异常]', err));
 

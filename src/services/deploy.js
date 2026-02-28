@@ -83,9 +83,27 @@ function generateNodeName(geo, existingNodes, isHomeNetwork = false) {
 }
 
 // 统一生成 xray client email（仅用于识别/统计，避免暴露真实信息）
-function makeEmail(userId) {
+function makeEmail(userId, protocol = '') {
   const safe = String(userId ?? '0').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || '0';
-  return `u-${safe}@p`;
+  // 协议后缀用于 Agent 统计按协议拆分：
+  // vless -> u-<id>-v@p, ss -> u-<id>-s@p
+  const suffix = protocol === 'ss' ? '-s' : (protocol === 'vless' ? '-v' : '');
+  return `u-${safe}${suffix}@p`;
+}
+
+function buildOutboundsBySocks(socks5Host, socks5Port, socks5User, socks5Pass) {
+  if (socks5Host) {
+    const socks5Server = { address: socks5Host, port: parseInt(socks5Port, 10) || 1080 };
+    if (socks5User) socks5Server.users = [{ user: socks5User, pass: socks5Pass || '' }];
+    return [
+      { protocol: 'socks', tag: 'socks5-out', settings: { servers: [socks5Server] } },
+      { protocol: 'freedom', tag: 'direct' }
+    ];
+  }
+  return [
+    { protocol: 'freedom', tag: 'direct' },
+    { protocol: 'blackhole', tag: 'blocked' }
+  ];
 }
 
 // ========== 生成 xray 多用户配置 ==========
@@ -211,9 +229,10 @@ async function syncNodeConfig(node, db) {
   // SS 节点：使用 SS 多用户配置
   if (node.protocol === 'ss') {
     const clients = userUuids.map(u => ({
-      password: u.uuid, email: makeEmail(u.user_id)
+      password: u.uuid, email: makeEmail(u.user_id, 'ss')
     }));
-    const config = buildSsXrayConfig(node.port, clients, node.ss_method || 'aes-256-gcm');
+    const ssOutbounds = buildOutboundsBySocks(node.socks5_host, node.socks5_port, node.socks5_user, node.socks5_pass);
+    const config = buildSsXrayConfig(node.port, clients, node.ss_method || 'aes-256-gcm', ssOutbounds);
 
     // 如果有同机 VLESS 伙伴节点，生成双协议配置
     const peerNode = findPeerNode(node, db);
@@ -221,16 +240,9 @@ async function syncNodeConfig(node, db) {
       const vlessUuids = db.getNodeAllUserUuids(peerNode.id);
       if (vlessUuids.length > 0) {
         const vlessClients = vlessUuids.map(u => ({
-          id: u.uuid, level: 0, email: makeEmail(u.user_id)
+          id: u.uuid, level: 0, email: makeEmail(u.user_id, 'vless')
         }));
-        let outbounds;
-        if (peerNode.socks5_host) {
-          const s = { address: peerNode.socks5_host, port: peerNode.socks5_port || 1080 };
-          if (peerNode.socks5_user) s.users = [{ user: peerNode.socks5_user, pass: peerNode.socks5_pass || '' }];
-          outbounds = [{ protocol: 'socks', tag: 'socks5-out', settings: { servers: [s] } }, { protocol: 'freedom', tag: 'direct' }];
-        } else {
-          outbounds = [{ protocol: 'freedom', tag: 'direct' }, { protocol: 'blackhole', tag: 'blocked' }];
-        }
+        const outbounds = buildOutboundsBySocks(peerNode.socks5_host, peerNode.socks5_port, peerNode.socks5_user, peerNode.socks5_pass);
         const realityOpts = peerNode.reality_private_key ? { privateKey: peerNode.reality_private_key, sni: peerNode.sni || 'www.microsoft.com', shortId: peerNode.reality_short_id } : null;
         const dualConfig = buildDualXrayConfig(peerNode.port, node.port, vlessClients, clients, node.ss_method || 'aes-256-gcm', outbounds, realityOpts);
         return await pushConfigToNode(node, dualConfig);
@@ -241,7 +253,7 @@ async function syncNodeConfig(node, db) {
 
   // VLESS 节点
   const clients = userUuids.map(u => ({
-    id: u.uuid, level: 0, email: makeEmail(u.user_id)
+    id: u.uuid, level: 0, email: makeEmail(u.user_id, 'vless')
   }));
 
   let outbounds;
@@ -267,7 +279,7 @@ async function syncNodeConfig(node, db) {
     const ssUuids = db.getNodeAllUserUuids(peerNode.id);
     if (ssUuids.length > 0) {
       const ssClients = ssUuids.map(u => ({
-        password: u.uuid, email: makeEmail(u.user_id)
+        password: u.uuid, email: makeEmail(u.user_id, 'ss')
       }));
       const dualConfig = buildDualXrayConfig(node.port, peerNode.port, clients, ssClients, peerNode.ss_method || 'aes-256-gcm', outbounds, realityOpts);
       return await pushConfigToNode(node, dualConfig);
@@ -411,7 +423,7 @@ async function deployNode(sshInfo, db) {
     // 生成多用户配置
     const userUuids = db.getNodeAllUserUuids(nodeId);
     const clients = userUuids.length > 0
-      ? userUuids.map(u => ({ id: u.uuid, level: 0, email: makeEmail(u.user_id) }))
+      ? userUuids.map(u => ({ id: u.uuid, level: 0, email: makeEmail(u.user_id, 'vless') }))
       : [{ id: uuid, level: 0, email: 'default@panel' }];
 
     let outbounds;
@@ -528,7 +540,13 @@ async function installAgentOnNode(ssh, nodeId, db) {
 // ========== IPv6 SS 自动部署 ==========
 
 // 生成 SS 多用户 xray 配置（带 stats）
-function buildSsXrayConfig(port, clients, ssMethod) {
+function buildSsXrayConfig(port, clients, ssMethod, outbounds = null) {
+  const finalOutbounds = Array.isArray(outbounds) && outbounds.length > 0
+    ? outbounds
+    : [
+      { tag: 'direct', protocol: 'freedom' },
+      { tag: 'block', protocol: 'blackhole' }
+    ];
   return {
     log: { loglevel: 'warning' },
     stats: {},
@@ -553,13 +571,13 @@ function buildSsXrayConfig(port, clients, ssMethod) {
         settings: { address: '127.0.0.1' }
       }
     ],
-    outbounds: [
-      { tag: 'direct', protocol: 'freedom' },
-      { tag: 'block', protocol: 'blackhole' }
-    ],
+    outbounds: finalOutbounds,
     routing: {
       rules: [
-        { type: 'field', inboundTag: ['api-in'], outboundTag: 'api' }
+        { type: 'field', inboundTag: ['api-in'], outboundTag: 'api' },
+        ...(finalOutbounds[0]?.tag === 'socks5-out'
+          ? [{ type: 'field', outboundTag: 'socks5-out', network: 'tcp,udp' }]
+          : [])
       ]
     }
   };
@@ -640,6 +658,10 @@ async function deploySsNode(sshInfo, db) {
     ssh_port: sshInfo.ssh_port || 22,
     ssh_user: sshInfo.ssh_user || 'root',
     ssh_password: sshInfo.ssh_password,
+    socks5_host: sshInfo.socks5_host || null,
+    socks5_port: parseInt(sshInfo.socks5_port, 10) || 1080,
+    socks5_user: sshInfo.socks5_user || null,
+    socks5_pass: sshInfo.socks5_pass || null,
     region, remark: '⏳ 部署中...', is_active: 0
   };
   const result = db.addNode(nodeData);
@@ -682,10 +704,11 @@ async function deploySsNode(sshInfo, db) {
     // 生成多用户 SS 配置（带 stats）
     const userUuids = db.getNodeAllUserUuids(nodeId);
     const clients = userUuids.length > 0
-      ? userUuids.map(u => ({ password: u.uuid, email: makeEmail(u.user_id) }))
+      ? userUuids.map(u => ({ password: u.uuid, email: makeEmail(u.user_id, 'ss') }))
       : [{ password: ssPassword, email: 'default@panel' }];
 
-    const config = buildSsXrayConfig(port, clients, ssMethod);
+    const outbounds = buildOutboundsBySocks(sshInfo.socks5_host, sshInfo.socks5_port, sshInfo.socks5_user, sshInfo.socks5_pass);
+    const config = buildSsXrayConfig(port, clients, ssMethod, outbounds);
     const configJson = JSON.stringify(config, null, 2);
     await ssh.execCommand('mkdir -p /usr/local/etc/xray');
     await sftpWriteFile(ssh, '/usr/local/etc/xray/config.json', configJson);
@@ -703,7 +726,7 @@ async function deploySsNode(sshInfo, db) {
     const startResult = await ssh.execCommand('systemctl enable xray && systemctl restart xray && sleep 2 && systemctl is-active --quiet xray && echo DEPLOY_OK || echo DEPLOY_FAIL');
 
     if (startResult.stdout.includes('DEPLOY_OK')) {
-      db.updateNode(nodeId, { is_active: 1, remark: '' });
+      db.updateNode(nodeId, { is_active: 1, remark: sshInfo.socks5_host ? '🏠 家宽落地' : '' });
       db.addAuditLog(sshInfo.triggered_by || null, 'node_deploy_ss', `SS部署成功: ${name} (IPv6: ${ipv6Addr}:${port})`, 'system');
       console.log(`[SS部署成功] ${name} (${ipv6Addr}:${port})`);
       try { notify.deploy(name, true, `IPv6 SS | ${ipv6Addr}:${port}`); } catch {}
@@ -775,6 +798,8 @@ async function deployDualNode(sshInfo, db) {
     protocol: 'ss', ip_version: 6, ss_method: ssMethod, ss_password: ssPassword,
     ssh_host: sshInfo.host, ssh_port: sshInfo.ssh_port || 22,
     ssh_user: sshInfo.ssh_user || 'root', ssh_password: sshInfo.ssh_password,
+    socks5_host: sshInfo.socks5_host || null, socks5_port: parseInt(sshInfo.socks5_port, 10) || 1080,
+    socks5_user: sshInfo.socks5_user || null, socks5_pass: sshInfo.socks5_pass || null,
     region, remark: '⏳ 部署中...', is_active: 0
   });
   const ssNodeId = ssResult.lastInsertRowid;
@@ -827,22 +852,15 @@ async function deployDualNode(sshInfo, db) {
     // 构建双协议配置
     const vlessUuids = db.getNodeAllUserUuids(vlessNodeId);
     const vlessClients = vlessUuids.length > 0
-      ? vlessUuids.map(u => ({ id: u.uuid, level: 0, email: makeEmail(u.user_id) }))
+      ? vlessUuids.map(u => ({ id: u.uuid, level: 0, email: makeEmail(u.user_id, 'vless') }))
       : [{ id: uuid, level: 0, email: 'default@panel' }];
 
     const ssUuids = db.getNodeAllUserUuids(ssNodeId);
     const ssClients = ssUuids.length > 0
-      ? ssUuids.map(u => ({ password: u.uuid, email: makeEmail(u.user_id) }))
+      ? ssUuids.map(u => ({ password: u.uuid, email: makeEmail(u.user_id, 'ss') }))
       : [{ password: ssPassword, email: 'default@panel' }];
 
-    let outbounds;
-    if (sshInfo.socks5_host) {
-      let s = { address: sshInfo.socks5_host, port: parseInt(sshInfo.socks5_port) || 1080 };
-      if (sshInfo.socks5_user) s.users = [{ user: sshInfo.socks5_user, pass: sshInfo.socks5_pass || '' }];
-      outbounds = [{ protocol: 'socks', tag: 'socks5-out', settings: { servers: [s] } }, { protocol: 'freedom', tag: 'direct' }];
-    } else {
-      outbounds = [{ protocol: 'freedom', tag: 'direct' }, { protocol: 'blackhole', tag: 'blocked' }];
-    }
+    const outbounds = buildOutboundsBySocks(sshInfo.socks5_host, sshInfo.socks5_port, sshInfo.socks5_user, sshInfo.socks5_pass);
 
     const config = buildDualXrayConfig(vlessPort, ssPort, vlessClients, ssClients, ssMethod, outbounds, { privateKey: realityPrivateKey, sni, shortId: realityShortId });
     const configJson = JSON.stringify(config, null, 2);
@@ -866,7 +884,7 @@ async function deployDualNode(sshInfo, db) {
 
     if (startResult.stdout.includes('DEPLOY_OK')) {
       db.updateNode(vlessNodeId, { is_active: 1, remark: sshInfo.socks5_host ? '🏠 家宽落地' : '' });
-      db.updateNode(ssNodeId, { is_active: 1, remark: '' });
+      db.updateNode(ssNodeId, { is_active: 1, remark: sshInfo.socks5_host ? '🏠 家宽落地' : '' });
       const msg = `双协议部署成功: ${vlessName} (VLESS ${sshInfo.host}:${vlessPort}) + ${ssName} (SS IPv6 ${ipv6Addr}:${ssPort})`;
       db.addAuditLog(sshInfo.triggered_by || null, 'node_deploy_dual', msg, 'system');
       console.log(`[双协议部署成功] ${msg}`);
