@@ -214,10 +214,7 @@ router.get('/', requireAuth, (req, res) => {
   const isVip = db.isInWhitelist(req.user.nodeloc_id);
   const user = req.user;
 
-  // 0级用户显示升级提示
-  if (!isVip && user.trust_level < 1) {
-    return res.render('upgrade', { user });
-  }
+  // 已开放 0 级用户访问，不再跳转升级页
 
   const nodes = db.getAllNodes(true).filter(n => isVip || req.user.trust_level >= (n.min_level || 0));
 
@@ -456,17 +453,7 @@ router.get('/sub/:token', subLimiter, (req, res) => {
     });
     return res.status(403).send('无效的订阅链接');
   }
-  if (user.trust_level < 1 && !db.isInWhitelist(user.nodeloc_id)) {
-    logSubAccessEventSafe({
-      ...eventBase,
-      userId: user.id,
-      result: 'deny',
-      reason: 'level_not_allowed',
-      httpStatus: 403,
-    });
-    return res.status(403).send('账号等级不足，请在 NodeLoc 论坛升级到1级后使用');
-  }
-
+  // 已开放 0 级用户订阅访问
   db.logSubAccess(user.id, clientIP, ua);
 
   // 滥用检测：24h 内 ≥20 个不同 IP 触发通知（同一用户1小时内只通知一次）
@@ -654,17 +641,7 @@ router.get('/sub6/:token', subLimiter, (req, res) => {
     });
     return res.status(403).send('无效的订阅链接');
   }
-  if (user.trust_level < 1 && !db.isInWhitelist(user.nodeloc_id)) {
-    logSubAccessEventSafe({
-      ...eventBase,
-      userId: user.id,
-      result: 'deny',
-      reason: 'level_not_allowed',
-      httpStatus: 403,
-    });
-    return res.status(403).send('账号等级不足，请在 NodeLoc 论坛升级到1级后使用');
-  }
-
+  // 已开放 0 级用户订阅访问
   db.logSubAccess(user.id, clientIP, ua);
 
   const isVip = db.isInWhitelist(user.nodeloc_id);

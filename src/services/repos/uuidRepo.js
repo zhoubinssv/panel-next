@@ -34,7 +34,7 @@ function getNodeAllUserUuids(nodeId) {
 }
 
 function ensureAllUsersHaveUuid(nodeId) {
-  const users = _getAllUsers().filter(u => !u.is_frozen && !u.is_blocked && (u.is_admin || u.trust_level >= 1));
+  const users = _getAllUsers().filter(u => !u.is_frozen && !u.is_blocked);
   const stmt = _getDb().prepare('INSERT OR IGNORE INTO user_node_uuid (user_id, node_id, uuid) VALUES (?, ?, ?)');
   const insertMany = _getDb().transaction((users) => {
     for (const user of users) {
@@ -46,7 +46,7 @@ function ensureAllUsersHaveUuid(nodeId) {
 
 function ensureUserHasAllNodeUuids(userId) {
   const u = _getDb().prepare('SELECT is_admin, trust_level, is_frozen, is_blocked FROM users WHERE id = ?').get(userId);
-  if (!u || u.is_frozen || u.is_blocked || (!u.is_admin && u.trust_level < 1)) return;
+  if (!u || u.is_frozen || u.is_blocked) return;
   const nodes = _getAllNodes();
   const stmt = _getDb().prepare('INSERT OR IGNORE INTO user_node_uuid (user_id, node_id, uuid) VALUES (?, ?, ?)');
   const insertMany = _getDb().transaction((nodes) => {
